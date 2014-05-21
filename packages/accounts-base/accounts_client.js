@@ -4,7 +4,7 @@
 
 // This is reactive.
 Meteor.userId = function () {
-  return Meteor.connection.userId();
+  return Accounts.connection.userId();
 };
 
 var loggingIn = false;
@@ -37,15 +37,16 @@ Meteor.user = function () {
 
 // Call a login method on the server.
 //
-// A login method is a method which on success calls `this.setUserId(id)` on
-// the server and returns an object with fields 'id' (containing the user id)
-// and 'token' (containing a resume token).
+// A login method is a method which on success calls `this.setUserId(id)` and
+// `Accounts._setLoginToken` on the server and returns an object with fields
+// 'id' (containing the user id), 'token' (containing a resume token), and
+// optionally `tokenExpires`.
 //
 // This function takes care of:
 //   - Updating the Meteor.loggingIn() reactive data source
 //   - Calling the method in 'wait' mode
 //   - On success, saving the resume token to localStorage
-//   - On success, calling Meteor.connection.setUserId()
+//   - On success, calling Accounts.connection.setUserId()
 //   - Setting up an onReconnect handler which logs in with
 //     the resume token
 //
@@ -91,9 +92,9 @@ Accounts.callLoginMethod = function (options) {
   // will occur before the callback from the resume login call.)
   var onResultReceived = function (err, result) {
     if (err || !result || !result.token) {
-      Meteor.connection.onReconnect = null;
+      Accounts.connection.onReconnect = null;
     } else {
-      Meteor.connection.onReconnect = function () {
+      Accounts.connection.onReconnect = function () {
         reconnected = true;
         // If our token was updated in storage, use the latest one.
         var storedToken = storedLoginToken();
@@ -184,7 +185,7 @@ Accounts.callLoginMethod = function (options) {
 
   if (!options._suppressLoggingIn)
     Accounts._setLoggingIn(true);
-  Meteor.apply(
+  Accounts.connection.apply(
     options.methodName,
     options.methodArguments,
     {wait: true, onResultReceived: onResultReceived},
@@ -193,17 +194,17 @@ Accounts.callLoginMethod = function (options) {
 
 makeClientLoggedOut = function() {
   unstoreLoginToken();
-  Meteor.connection.setUserId(null);
-  Meteor.connection.onReconnect = null;
+  Accounts.connection.setUserId(null);
+  Accounts.connection.onReconnect = null;
 };
 
 makeClientLoggedIn = function(userId, token, tokenExpires) {
   storeLoginToken(userId, token, tokenExpires);
-  Meteor.connection.setUserId(userId);
+  Accounts.connection.setUserId(userId);
 };
 
 Meteor.logout = function (callback) {
-  Meteor.apply('logout', [], {wait: true}, function(error, result) {
+  Accounts.connection.apply('logout', [], {wait: true}, function(error, result) {
     if (error) {
       callback && callback(error);
     } else {
@@ -214,38 +215,40 @@ Meteor.logout = function (callback) {
 };
 
 Meteor.logoutOtherClients = function (callback) {
-  // Call the `logoutOtherClients` method. Store the login token that we get
-  // back and use it to log in again. The server is not supposed to close
-  // connections on the old token for 10 seconds, so we should have time to
-  // store our new token and log in with it before being disconnected. If we get
-  // disconnected, then we'll immediately reconnect with the new token. If for
-  // some reason we get disconnected before storing the new token, then the
-  // worst that will happen is that we'll have a flicker from trying to log in
-  // with the old token before storing and logging in with the new one.
-  Meteor.apply('logoutOtherClients', [], { wait: true },
-               function (error, result) {
-                 if (error) {
-                   callback && callback(error);
-                 } else {
-                   var userId = Meteor.userId();
-                   storeLoginToken(userId, result.token, result.tokenExpires);
-                   // If the server hasn't disconnected us yet by deleting our
-                   // old token, then logging in now with the new valid token
-                   // will prevent us from getting disconnected. If the server
-                   // has already disconnected us due to our old invalid token,
-                   // then we would have already tried and failed to login with
-                   // the old token on reconnect, and we have to make sure a
-                   // login method gets sent here with the new token.
-                   Meteor.loginWithToken(result.token, function (err) {
-                     if (err &&
-                         storedLoginToken() &&
-                         storedLoginToken().token === result.token) {
-                       makeClientLoggedOut();
-                     }
-                     callback && callback(err);
-                   });
-                 }
-               });
+  // We need to make two method calls: one to replace our current token,
+  // and another to remove all tokens except the current one. We want to
+  // call these two methods one after the other, without any other
+  // methods running between them. For example, we don't want `logout`
+  // to be called in between our two method calls (otherwise the second
+  // method call would return an error). Another example: we don't want
+  // logout to be called before the callback for `getNewToken`;
+  // otherwise we would momentarily log the user out and then write a
+  // new token to localStorage.
+  //
+  // To accomplish this, we make both calls as wait methods, and queue
+  // them one after the other, without spinning off the event loop in
+  // between. Even though we queue `removeOtherTokens` before
+  // `getNewToken`, we won't actually send the `removeOtherTokens` call
+  // until the `getNewToken` callback has finished running, because they
+  // are both wait methods.
+  Accounts.connection.apply(
+    'getNewToken',
+    [],
+    { wait: true },
+    function (err, result) {
+      if (! err) {
+        storeLoginToken(Meteor.userId(), result.token, result.tokenExpires);
+      }
+    }
+  );
+  Accounts.connection.apply(
+    'removeOtherTokens',
+    [],
+    { wait: true },
+    function (err) {
+      callback && callback(err);
+    }
+  );
 };
 
 
@@ -253,7 +256,8 @@ Meteor.logoutOtherClients = function (callback) {
 /// LOGIN SERVICES
 ///
 
-var loginServicesHandle = Meteor.subscribe("meteor.loginServiceConfiguration");
+var loginServicesHandle =
+  Accounts.connection.subscribe("meteor.loginServiceConfiguration");
 
 // A reactive function returning whether the loginServiceConfiguration
 // subscription is ready. Used by accounts-ui to hide the login button
@@ -267,13 +271,13 @@ Accounts.loginServicesConfigured = function () {
 /// HANDLEBARS HELPERS
 ///
 
-// If we're using Handlebars, register the {{currentUser}} and
-// {{loggingIn}} global helpers.
-if (Package.handlebars) {
-  Package.handlebars.Handlebars.registerHelper('currentUser', function () {
+// If our app has a UI, register the {{currentUser}} and {{loggingIn}}
+// global helpers.
+if (Package.ui) {
+  Package.ui.UI.registerHelper('currentUser', function () {
     return Meteor.user();
   });
-  Package.handlebars.Handlebars.registerHelper('loggingIn', function () {
+  Package.ui.UI.registerHelper('loggingIn', function () {
     return Meteor.loggingIn();
   });
 }

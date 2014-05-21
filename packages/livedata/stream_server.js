@@ -1,3 +1,5 @@
+var url = Npm.require('url');
+
 var pathPrefix = __meteor_runtime_config__.ROOT_URL_PATH_PREFIX ||  "";
 
 StreamServer = function () {
@@ -21,7 +23,7 @@ StreamServer = function () {
     log: function() {},
     // this is the default, but we code it explicitly because we depend
     // on it in stream_client:HEARTBEAT_TIMEOUT
-    heartbeat_delay: 25000,
+    heartbeat_delay: 45000,
     // The default disconnect_delay is 5 seconds, but if the server ends up CPU
     // bound for that much time, SockJS might not notice that the user has
     // reconnected because the timer (of disconnect_delay ms) can fire before
@@ -64,6 +66,18 @@ StreamServer = function () {
   self._redirectWebsocketEndpoint();
 
   self.server.on('connection', function (socket) {
+
+    if (Package.webapp.WebAppInternals.usingDdpProxy) {
+      // If we are behind a DDP proxy, immediately close any sockjs connections
+      // that are not using websockets; the proxy will terminate sockjs for us,
+      // so we don't expect to be handling any other transports.
+      if (socket.protocol !== "websocket" &&
+          socket.protocol !== "websocket-raw") {
+        socket.close();
+        return;
+      }
+    }
+
     socket.send = function (data) {
       socket.write(data);
     };
@@ -125,9 +139,13 @@ _.extend(StreamServer.prototype, {
         // Store arguments for use within the closure below
         var args = arguments;
 
-        if (request.url === pathPrefix + '/websocket' ||
-            request.url === pathPrefix + '/websocket/') {
-          request.url = self.prefix + '/websocket';
+        // Rewrite /websocket and /websocket/ urls to /sockjs/websocket while
+        // preserving query string.
+        var parsedUrl = url.parse(request.url);
+        if (parsedUrl.pathname === pathPrefix + '/websocket' ||
+            parsedUrl.pathname === pathPrefix + '/websocket/') {
+          parsedUrl.pathname = self.prefix + '/websocket';
+          request.url = url.format(parsedUrl);
         }
         _.each(oldHttpServerListeners, function(oldListener) {
           oldListener.apply(httpServer, args);
